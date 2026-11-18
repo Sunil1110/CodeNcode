@@ -1,0 +1,43 @@
+rules_version = '2';
+
+// ChipBank has no passwords (a name is the login), so anyone with the site can
+// read and play. These rules keep the damage of that small:
+//   - nothing can ever be deleted
+//   - a finished game can never be changed again
+//   - history entries can be added but never edited or removed
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function validGame(g) {
+      return g.id is string
+        && g.title is string && g.title.size() <= 40
+        && g.status in ['lobby', 'live', 'ended', 'closed']
+        && g.buyIn is int
+        && g.seq is int
+        && g.players is list && g.players.size() <= 30
+        && g.pot is map;
+    }
+
+    match /games/{gameId} {
+      allow read: if true;
+      allow create: if validGame(request.resource.data)
+        && request.resource.data.id == gameId
+        && request.resource.data.status == 'lobby';
+      allow update: if resource.data.status in ['lobby', 'live']
+        && validGame(request.resource.data)
+        && request.resource.data.id == gameId
+        && request.resource.data.seq > resource.data.seq;
+      allow delete: if false;
+
+      match /entries/{entryId} {
+        allow read: if true;
+        allow create: if request.resource.data.n is int
+          && request.resource.data.t is number
+          && request.resource.data.type is string
+          && request.resource.data.text is string
+          && request.resource.data.text.size() <= 600;
+        allow update, delete: if false;
+      }
+    }
+  }
+}

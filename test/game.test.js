@@ -1,9 +1,7 @@
-'use strict';
+import test from 'node:test';
+import assert from 'node:assert/strict';
 
-const test = require('node:test');
-const assert = require('node:assert/strict');
-
-const { GameError, applyAction, createGame, settle, standings, view } = require('../lib/game');
+import { GameError, applyAction, createGame, settle, standings, view } from '../public/game.js';
 
 const firstPlayer = () => 0; // rng that always picks the first candidate
 
@@ -144,6 +142,21 @@ test('every change is written to the history in order', () => {
   act(game, 'bet', 'Ravi', { amount: 25 });
   assert.deepEqual(game.entries.map((e) => e.n), game.entries.map((_, i) => i + 1));
   assert.equal(game.entries.at(-1).text, 'Ravi put 25 chips in the pot');
-  assert.equal(view(game, { entryLimit: 2 }).entries.length, 2);
-  assert.equal(view(game, { entryLimit: 2 }).entryCount, game.entries.length);
+  assert.equal(view(game).entryCount, game.entries.length);
+});
+
+test('a game that never starts is closed, not settled', () => {
+  const game = createGame({ id: 'A', title: '', buyIn: 500, now: 1 });
+  act(game, 'join', 'Asha');
+  act(game, 'join', 'Ravi');
+  act(game, 'leave', 'Ravi');
+  assert.equal(game.status, 'lobby');
+  act(game, 'leave', 'Asha');
+  assert.equal(game.status, 'closed');
+  assert.throws(() => act(game, 'join', 'Asha'), /closed/);
+
+  const other = createGame({ id: 'B', title: '', buyIn: 500, now: 1 });
+  act(other, 'join', 'Asha');
+  act(other, 'end', 'Asha');
+  assert.equal(other.status, 'closed');
 });

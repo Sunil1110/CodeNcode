@@ -1,22 +1,21 @@
-'use strict';
-
-// Pure game rules for the chip tracker. Nothing in here touches the network or
-// the disk: every function takes a game object and either mutates it or reads it.
+// Pure game rules for the chip tracker, shared by the page and the tests.
+// Nothing in here touches the network or storage: every function takes a game
+// object and either mutates it or reads it.
 
 const MAX_AMOUNT = 1_000_000_000;
 const MAX_PLAYERS = 30;
 const NAME_LENGTH = 20;
 const TITLE_LENGTH = 40;
 
-class GameError extends Error {}
+export class GameError extends Error {}
 
-function cleanName(raw) {
+export function cleanName(raw) {
   const name = String(raw ?? '').replace(/\s+/g, ' ').trim().slice(0, NAME_LENGTH).trim();
   if (!name) throw new GameError('Please enter a name.');
   return name;
 }
 
-const keyOf = (name) => name.toLowerCase();
+export const keyOf = (name) => name.toLowerCase();
 
 function cleanTitle(raw) {
   const title = String(raw ?? '').replace(/\s+/g, ' ').trim().slice(0, TITLE_LENGTH).trim();
@@ -39,12 +38,12 @@ function listNames(names) {
   return `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`;
 }
 
-function createGame({ id, title, buyIn, now }) {
+export function createGame({ id, title, buyIn, now }) {
   return {
     id,
     title: cleanTitle(title),
     buyIn: buyIn === undefined || buyIn === '' ? 1000 : cleanAmount(buyIn),
-    status: 'lobby', // lobby -> live -> ended
+    status: 'lobby', // lobby -> live -> ended, or lobby -> closed if it never starts
     createdAt: now,
     startedAt: null,
     endedAt: null,
@@ -65,9 +64,14 @@ function addEntry(game, now, type, actor, text, data = {}) {
 const findPlayer = (game, key) => game.players.find((p) => p.key === key);
 const activePlayers = (game) => game.players.filter((p) => p.active);
 
-function requireLive(game) {
-  if (game.status === 'lobby') throw new GameError('The game has not started yet.');
+function requireOpen(game) {
   if (game.status === 'ended') throw new GameError('This game has ended.');
+  if (game.status === 'closed') throw new GameError('This game was closed.');
+}
+
+function requireLive(game) {
+  requireOpen(game);
+  if (game.status === 'lobby') throw new GameError('The game has not started yet.');
 }
 
 function requireActive(game, name) {
@@ -100,7 +104,7 @@ function pickBank(game, now, rng) {
 
 const actions = {
   join(game, a, now) {
-    if (game.status === 'ended') throw new GameError('This game has ended.');
+    requireOpen(game);
     const name = cleanName(a.name);
     const existing = findPlayer(game, keyOf(name));
     if (existing) {
@@ -129,11 +133,13 @@ const actions = {
   },
 
   leave(game, a, now, rng) {
-    if (game.status === 'ended') throw new GameError('This game has ended.');
+    requireOpen(game);
     const player = requireActive(game, a.name);
     if (game.status === 'lobby') {
       game.players = game.players.filter((p) => p !== player);
       addEntry(game, now, 'leave', player.name, `${player.name} left`);
+      // Nobody is waiting any more, so there is no game left to start.
+      if (!game.players.length) game.status = 'closed';
       return;
     }
     player.active = false;
@@ -285,8 +291,14 @@ const actions = {
   },
 
   end(game, a, now) {
-    requireLive(game);
+    requireOpen(game);
     const player = requireActive(game, a.name);
+    // A game that never started has no chips to settle: just take it down.
+    if (game.status === 'lobby') {
+      game.status = 'closed';
+      addEntry(game, now, 'end', player.name, `${player.name} closed the game`);
+      return;
+    }
     if (game.bankKey) requireBank(game, player);
     if (game.pot.total) {
       for (const p of game.players) {
@@ -304,7 +316,7 @@ const actions = {
   },
 };
 
-function applyAction(game, action, now = Date.now(), rng = Math.random) {
+export function applyAction(game, action, now = Date.now(), rng = Math.random) {
   const handler = Object.hasOwn(actions, action?.type) ? actions[action.type] : null;
   if (!handler) throw new GameError('Unknown action.');
   handler(game, action, now, rng);
@@ -312,7 +324,7 @@ function applyAction(game, action, now = Date.now(), rng = Math.random) {
 
 // What each player is up or down. Chips sitting in the pot still belong to
 // whoever put them there until the pot is awarded.
-function standings(game) {
+export function standings(game) {
   return game.players.map((p) => {
     const inPot = game.pot.by[p.key] || 0;
     return { ...p, inPot, net: p.chips + inPot + p.returned - p.bought };
@@ -321,7 +333,7 @@ function standings(game) {
 
 // Fewest simple payments that clear everyone's balance: the biggest loser pays
 // the biggest winner, and so on down the list.
-function settle(rows) {
+export function settle(rows) {
   const byAmount = (a, b) => b.amount - a.amount || a.name.localeCompare(b.name);
   const debtors = rows
     .filter((r) => r.net < 0)
@@ -345,7 +357,7 @@ function settle(rows) {
   return payments;
 }
 
-function view(game, { entryLimit } = {}) {
+export function view(game) {
   const players = standings(game);
   const bank = players.find((p) => p.key === game.bankKey);
   return {
@@ -353,12 +365,11 @@ function view(game, { entryLimit } = {}) {
     players,
     bankName: bank ? bank.name : null,
     settlement: settle(players),
-    entries: entryLimit ? game.entries.slice(-entryLimit) : game.entries,
     entryCount: game.seq,
   };
 }
 
-function summary(game) {
+export function summary(game) {
   const players = standings(game);
   const bank = players.find((p) => p.key === game.bankKey);
   return {
@@ -374,15 +385,3 @@ function summary(game) {
     players: players.map((p) => ({ key: p.key, name: p.name, active: p.active, net: p.net })),
   };
 }
-
-module.exports = {
-  GameError,
-  applyAction,
-  cleanName,
-  createGame,
-  keyOf,
-  settle,
-  standings,
-  summary,
-  view,
-};

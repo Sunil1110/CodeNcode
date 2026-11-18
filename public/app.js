@@ -1,7 +1,7 @@
-'use strict';
+/* ChipBank page: no build step. The store (backend.js) pushes the current game
+   every time anyone changes it, and this file re-renders from that. */
 
-/* ChipBank client: one page, no build step. The server pushes the full game
-   state over server-sent events and this file re-renders from it. */
+import { loadBackend } from './backend.js';
 
 const NAME_KEY = 'chipbank.name';
 const $app = document.getElementById('app');
@@ -13,14 +13,16 @@ const state = {
   game: null, // current game
   gone: false, // current game does not exist
   online: true,
+  failed: null, // message when the store could not be loaded or read
   tab: 'table',
   sheet: null,
   toast: null,
   busy: false,
-  hist: { id: null, list: [], complete: false, loading: false },
+  hist: { id: null, list: [], stop: null },
 };
 
-let stream = null;
+let backend = null;
+let stopWatching = null;
 let sheetSeq = 0;
 let focusedSheet = 0;
 let toastTimer = null;
@@ -85,110 +87,77 @@ function toast(message, kind = 'info') {
   render();
 }
 
-async function api(method, url, body) {
-  let res;
-  try {
-    res = await fetch(url, {
-      method,
-      headers: body ? { 'Content-Type': 'application/json' } : undefined,
-      body: body ? JSON.stringify(body) : undefined,
-    });
-  } catch {
-    throw new Error('Could not reach the server. Check your connection.');
-  }
-  let data = {};
-  try {
-    data = await res.json();
-  } catch {
-    /* handled below */
-  }
-  if (!res.ok) throw new Error(data.error || 'Something went wrong. Please try again.');
-  return data;
-}
-
-// ---------- server state ----------
+// ---------- shared state ----------
 
 function connect() {
-  if (stream) stream.close();
-  const id = state.route.page === 'game' ? state.route.id : null;
-  stream = new EventSource(id ? `/api/stream?game=${encodeURIComponent(id)}` : '/api/stream');
-  stream.onopen = () => {
-    if (!state.online) {
-      state.online = true;
-      render();
-    }
+  if (stopWatching) stopWatching();
+  stopWatching = null;
+  if (state.hist.stop) state.hist.stop();
+  state.hist = { id: null, list: [], stop: null };
+  if (!backend) return;
+
+  const onError = (err) => {
+    state.failed = err.message;
+    render();
   };
-  stream.onerror = () => {
-    if (state.online) {
-      state.online = false;
+  if (state.route.page === 'game') {
+    const { id } = state.route;
+    stopWatching = backend.watchGame(
+      id,
+      (game, meta) => {
+        if (state.route.page !== 'game' || state.route.id !== id) return;
+        state.failed = null;
+        state.online = !meta.offline;
+        if (game) applyGame(game);
+        else if (game === undefined) render(); // still waiting for the first answer
+        else {
+          state.gone = true;
+          state.game = null;
+          state.sheet = null;
+          render();
+        }
+      },
+      onError,
+    );
+  } else {
+    stopWatching = backend.watchGames((games, meta) => {
+      state.failed = null;
+      state.online = !meta.offline;
+      state.games = games;
       render();
-    }
-  };
-  stream.onmessage = (ev) => {
-    const data = JSON.parse(ev.data);
-    state.online = true;
-    if (data.games) {
-      state.games = data.games;
-      render();
-    } else if (data.gone) {
-      state.gone = true;
-      state.game = null;
-      state.sheet = null;
-      render();
-    } else if (data.game) {
-      applyGame(data.game);
-    }
-  };
+    }, onError);
+  }
 }
 
 function applyGame(game) {
-  if (state.route.page !== 'game' || state.route.id !== game.id) return;
   if (state.game && game.seq < state.game.seq) return; // stale update
   const justEnded = state.game && state.game.status !== 'ended' && game.status === 'ended';
   state.game = game;
   state.gone = false;
   if (justEnded) state.sheet = null;
-  mergeEntries(game);
-  ensureHistory();
+  watchHistory();
   render();
 }
 
-// Live updates only carry recent entries; keep a running copy and fetch the
-// full history when someone actually looks at it.
-function mergeEntries(game) {
-  const h = state.hist;
-  if (h.id !== game.id) Object.assign(h, { id: game.id, list: [], complete: false, loading: false });
-  const last = h.list.length ? h.list[h.list.length - 1].n : 0;
-  for (const e of game.entries) if (e.n > last) h.list.push(e);
-  h.complete = h.list.length === game.entryCount;
-}
-
-async function ensureHistory() {
+// The history is only loaded once someone looks at it, then kept up to date.
+function watchHistory() {
   const g = state.game;
   const h = state.hist;
-  if (!g || h.complete || h.loading) return;
+  if (!g || h.id === g.id) return;
   if (state.tab !== 'history' && g.status !== 'ended') return;
-  h.loading = true;
-  try {
-    const data = await api('GET', `/api/games/${g.id}`);
-    if (h.id === data.game.id) {
-      h.list = data.game.entries;
-      h.complete = true;
-    }
-  } catch {
-    /* the next update will try again */
-  } finally {
-    h.loading = false;
+  h.id = g.id;
+  h.stop = backend.watchEntries(g.id, (entries) => {
+    if (state.hist !== h) return;
+    h.list = entries;
     render();
-  }
+  });
 }
 
 async function act(type, extra = {}) {
   if (state.busy || !state.game) return false;
   state.busy = true;
   try {
-    const data = await api('POST', `/api/games/${state.game.id}/action`, { name: state.name, type, ...extra });
-    if (data.game) applyGame(data.game);
+    await backend.act(state.game.id, { name: state.name, type, ...extra });
     return true;
   } catch (err) {
     toast(err.message, 'error');
@@ -204,7 +173,7 @@ function viewLogin() {
   const joining = state.route.page === 'game';
   return `
   <main class="page login" data-key="login">
-    <div class="logo"><img src="/icon.svg" alt=""><strong>ChipBank</strong></div>
+    <div class="logo"><img src="./icon.svg" alt=""><strong>ChipBank</strong></div>
     <div class="stack">
       <h1>${joining ? 'Enter your name to join the game.' : 'Cards on the table, chips on your phone.'}</h1>
       <p class="muted">No password. Use the same name each time and your chips follow you.</p>
@@ -264,18 +233,24 @@ function viewHome() {
   return `
   <main class="page" data-key="home">
     <header class="home-head">
-      <div class="logo"><img src="/icon.svg" alt=""><strong>ChipBank</strong></div>
+      <div class="logo"><img src="./icon.svg" alt=""><strong>ChipBank</strong></div>
       <div class="who">Playing as <b>${esc(state.name)}</b>
         <button class="link" data-action="open-sheet" data-sheet="name">Change name</button>
       </div>
     </header>
 
-    ${state.online ? '' : '<div class="notice offline" data-key="offline">Reconnecting…</div>'}
+    ${
+      backend.kind === 'local'
+        ? '<div class="notice" data-key="demo"><span class="grow"><b>Demo mode.</b> No database is connected yet, so games stay on this device and are not shared with other phones.</span></div>'
+        : ''
+    }
+    ${state.failed ? `<div class="notice offline" data-key="failed">${esc(state.failed)}</div>` : ''}
+    ${state.online || state.failed ? '' : '<div class="notice offline" data-key="offline">No connection. Trying to reconnect…</div>'}
 
     <h2 class="section-title" data-key="t-live">Games on now</h2>
     ${
       !games
-        ? '<p class="empty" data-key="live-empty">Loading…</p>'
+        ? `<p class="empty" data-key="live-empty">${state.failed ? 'Games could not be loaded.' : 'Loading…'}</p>`
         : live.length
           ? `<ul class="game-list" data-key="live-list">${live.map(liveItem).join('')}</ul>`
           : '<p class="empty" data-key="live-empty">No game is running. Start one below.</p>'
@@ -315,7 +290,10 @@ function viewGame() {
   }
   const g = state.game;
   if (!g) {
-    return `<main class="page" data-key="loading"><p class="empty">Loading game…</p></main>`;
+    return `<main class="page" data-key="loading">
+      <p class="empty">${state.failed ? esc(state.failed) : state.online ? 'Loading game…' : 'No connection. Trying to reconnect…'}</p>
+      ${state.failed ? '<a class="btn block" href="#/">See all games</a>' : ''}
+    </main>`;
   }
 
   const me = g.players.find((p) => p.key === myKey());
@@ -571,7 +549,8 @@ function chipSheet(g) {
 
 function historyList() {
   const h = state.hist;
-  if (!h.list.length) return '<p class="empty">Nothing yet.</p>';
+  const complete = h.list.length >= state.game.entryCount;
+  if (!h.list.length) return `<p class="empty">${complete ? 'Nothing yet.' : 'Loading…'}</p>`;
   const items = [...h.list]
     .reverse()
     .map(
@@ -579,7 +558,7 @@ function historyList() {
         `<li class="${esc(e.type)}" data-key="e${e.n}"><time>${timeOf(e.t)}</time><span class="txt">${esc(e.text)}</span></li>`,
     )
     .join('');
-  return `<ul class="log">${items}</ul>${h.complete ? '' : '<p class="small muted center" style="margin-top:10px">Loading earlier entries…</p>'}`;
+  return `<ul class="log">${items}</ul>`;
 }
 
 function viewEnded({ g }) {
@@ -761,9 +740,20 @@ function morph(from, to) {
   while (from.childNodes.length > wanted.length) from.lastChild.remove();
 }
 
+function viewStartup() {
+  if (!state.failed) return '<main class="page" data-key="boot"><p class="empty">Loading…</p></main>';
+  return `
+  <main class="page login" data-key="boot">
+    <div class="logo"><img src="./icon.svg" alt=""><strong>ChipBank</strong></div>
+    <p>${esc(state.failed)}</p>
+    <button class="btn primary block" data-action="reload">Try again</button>
+  </main>`;
+}
+
 function render() {
   let page;
-  if (!state.name) page = viewLogin();
+  if (!backend) page = viewStartup();
+  else if (!state.name) page = viewLogin();
   else if (state.route.page === 'game') page = viewGame();
   else page = viewHome();
 
@@ -883,12 +873,12 @@ document.addEventListener('submit', async (ev) => {
     if (state.busy) return;
     state.busy = true;
     try {
-      const data = await api('POST', '/api/games', {
+      const id = await backend.createGame({
         name: state.name,
         title: form.querySelector('[name=title]').value,
         buyIn: form.querySelector('[name=buyIn]').value,
       });
-      location.hash = `#/g/${data.game.id}`;
+      location.hash = `#/g/${id}`;
     } catch (err) {
       toast(err.message, 'error');
     } finally {
@@ -921,7 +911,7 @@ document.addEventListener('click', async (ev) => {
       break;
     case 'tab':
       state.tab = el.dataset.tab;
-      ensureHistory();
+      watchHistory();
       render();
       break;
     case 'join':
@@ -929,7 +919,7 @@ document.addEventListener('click', async (ev) => {
       break;
     case 'join-open':
       try {
-        await api('POST', `/api/games/${el.dataset.id}/action`, { name: state.name, type: 'join' });
+        await backend.act(el.dataset.id, { name: state.name, type: 'join' });
         location.hash = `#/g/${el.dataset.id}`;
       } catch (err) {
         toast(err.message, 'error');
@@ -969,7 +959,7 @@ document.addEventListener('click', async (ev) => {
       }
       break;
     case 'share': {
-      const url = `${location.origin}/#/g/${g.id}`;
+      const url = `${location.origin}${location.pathname}${location.search}#/g/${g.id}`;
       const text = `Join "${g.title}" on ChipBank`;
       try {
         if (navigator.share) await navigator.share({ title: 'ChipBank', text, url });
@@ -982,6 +972,9 @@ document.addEventListener('click', async (ev) => {
       }
       break;
     }
+    case 'reload':
+      location.reload();
+      break;
     default:
       break;
   }
@@ -1001,5 +994,13 @@ window.addEventListener('hashchange', () => {
   render();
 });
 
-connect();
 render();
+loadBackend()
+  .then((loaded) => {
+    backend = loaded;
+    connect();
+  })
+  .catch(() => {
+    state.failed = 'ChipBank could not start. Check your connection and try again.';
+  })
+  .finally(render);
