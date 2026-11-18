@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Player Hands</title>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
+<script>
+/* Paste YOUR OWN Firebase project's web config here.
+   While apiKey is empty the page shows built-in sample hands.
+
+   Expected Firestore data — collection "players", one document per player:
+     { name: "Asha", cards: ["AS", "KD"], seat: 1 }
+   Card codes: rank (2-9, T, J, Q, K, A) + suit (S, H, D, C). "10H" also works. */
+window.FIREBASE_CONFIG = {
+  apiKey: "",
+  authDomain: "",
+  projectId: ""
+};
+window.PLAYERS_COLLECTION = "players";
+</script>
+<style>
+  :root {
+    --felt: #0e5c3f; --felt-dark: #083b29; --panel: rgba(0, 0, 0, .28);
+    --text: #f4f1e6; --mute: #b9cfc4; --gold: #e8c46a;
+    --card: #fdfdfb; --red: #c8102e; --black: #1b1b1f;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; color: var(--text);
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    background: radial-gradient(ellipse at top, var(--felt), var(--felt-dark)) fixed;
+  }
+  header { padding: 20px 16px 8px; text-align: center; }
+  h1 { margin: 0; font-size: 1.5rem; letter-spacing: .02em; }
+  h1 b { color: var(--gold); }
+  #status { margin-top: 6px; font-size: .85rem; color: var(--mute); }
+  #status.err { color: #ffb4a8; }
+  main {
+    display: grid; gap: 16px; padding: 16px; max-width: 1100px; margin: 0 auto;
+    grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  }
+  .player {
+    background: var(--panel); border: 1px solid rgba(255, 255, 255, .12);
+    border-radius: 14px; padding: 14px;
+  }
+  .name { font-weight: 600; margin-bottom: 10px; overflow-wrap: anywhere; }
+  .hand { display: flex; flex-wrap: wrap; gap: 8px; }
+  .pc {
+    width: 64px; height: 90px; border-radius: 8px; background: var(--card);
+    color: var(--black); box-shadow: 0 3px 8px rgba(0, 0, 0, .35);
+    position: relative; font-weight: 700; user-select: none;
+  }
+  .pc.red { color: var(--red); }
+  .pc .corner { position: absolute; top: 5px; left: 7px; line-height: 1; font-size: 1.05rem; text-align: center; }
+  .pc .corner span { display: block; font-size: .9rem; }
+  .pc .pip { position: absolute; inset: 0; display: grid; place-items: center; font-size: 2rem; padding-top: 12px; }
+  .empty { grid-column: 1 / -1; text-align: center; color: var(--mute); padding: 40px 0; }
+  .nocards { color: var(--mute); font-size: .9rem; }
+</style>
+</head>
+<body>
+<header>
+  <h1>♠ Player <b>Hands</b></h1>
+  <div id="status">Loading…</div>
+</header>
+<main id="table"></main>
+
+<script>
+(function () {
+  const SAMPLE = [
+    { name: "Asha",  seat: 1, cards: ["AS", "KS"] },
+    { name: "Rohan", seat: 2, cards: ["QH", "QD"] },
+    { name: "Meera", seat: 3, cards: ["7C", "8C"] },
+    { name: "Vikram", seat: 4, cards: ["TD", "JH"] },
+    { name: "Priya", seat: 5, cards: ["2H", "9S"] },
+    { name: "Karan", seat: 6, cards: ["AD", "5C"] }
+  ];
+  const SUITS = { S: "♠", H: "♥", D: "♦", C: "♣" };
+  const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  const $status = document.getElementById("status");
+  const $table = document.getElementById("table");
+
+  function cardHtml(code) {
+    const c = String(code || "").trim().toUpperCase();
+    const suit = c.slice(-1), rank = c.slice(0, -1) === "T" ? "10" : c.slice(0, -1);
+    if (!SUITS[suit] || !rank) return "";
+    const red = suit === "H" || suit === "D";
+    return `<div class="pc${red ? " red" : ""}" aria-label="${esc(rank + " " + suit)}">
+      <div class="corner">${esc(rank)}<span>${SUITS[suit]}</span></div>
+      <div class="pip">${SUITS[suit]}</div></div>`;
+  }
+
+  function render(players) {
+    if (!players.length) { $table.innerHTML = `<div class="empty">No players found.</div>`; return; }
+    players = players.slice().sort((a, b) => (a.seat || 0) - (b.seat || 0) || String(a.name).localeCompare(String(b.name)));
+    $table.innerHTML = players.map((p) => {
+      const cards = (Array.isArray(p.cards) ? p.cards : []).map(cardHtml).join("");
+      return `<section class="player"><div class="name">${esc(p.name || p.id || "Player")}</div>
+        <div class="hand">${cards || `<span class="nocards">No cards</span>`}</div></section>`;
+    }).join("");
+  }
+
+  function setStatus(msg, err) { $status.textContent = msg; $status.className = err ? "err" : ""; }
+
+  const cfg = window.FIREBASE_CONFIG || {};
+  if (!cfg.apiKey || !cfg.projectId || !window.firebase) {
+    render(SAMPLE);
+    setStatus("Demo mode — showing sample hands. Add your Firebase config to load real data.");
+    return;
+  }
+  try {
+    firebase.initializeApp(cfg);
+    firebase.firestore().collection(window.PLAYERS_COLLECTION || "players").onSnapshot(
+      (snap) => {
+        render(snap.docs.map((d) => ({ id: d.id, ...d.data() })));
+        setStatus("Live from Firebase · updated " + new Date().toLocaleTimeString());
+      },
+      (e) => { setStatus("Could not read from Firebase: " + (e.code || e.message), true); }
+    );
+  } catch (e) {
+    setStatus("Firebase setup error: " + (e.message || e), true);
+  }
+})();
+</script>
+</body>
+</html>
